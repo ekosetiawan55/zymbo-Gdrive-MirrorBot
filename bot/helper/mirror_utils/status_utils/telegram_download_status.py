@@ -1,25 +1,20 @@
-from bot import DOWNLOAD_DIR
 from bot.helper.ext_utils.bot_utils import MirrorStatus, get_readable_file_size, get_readable_time
-from .status import Status
 
 
-class TelegramDownloadStatus(Status):
-    def __init__(self, obj, listener):
-        self.obj = obj
-        self.uid = listener.uid
+class TelegramDownloadStatus:
+    def __init__(self, obj, listener, gid):
+        self.__obj = obj
+        self.__gid = gid
         self.message = listener.message
 
     def gid(self):
-        return self.obj.gid
-
-    def path(self):
-        return f"{DOWNLOAD_DIR}{self.uid}"
+        return self.__gid
 
     def processed_bytes(self):
-        return self.obj.downloaded_bytes
+        return self.__obj.downloaded_bytes
 
     def size_raw(self):
-        return self.obj.size
+        return self.__obj.size
 
     def size(self):
         return get_readable_file_size(self.size_raw())
@@ -28,10 +23,10 @@ class TelegramDownloadStatus(Status):
         return MirrorStatus.STATUS_DOWNLOADING
 
     def name(self):
-        return self.obj.name
+        return self.__obj.name
 
     def progress_raw(self):
-        return self.obj.progress
+        return self.__obj.progress
 
     def progress(self):
         return f'{round(self.progress_raw(), 2)}%'
@@ -40,7 +35,7 @@ class TelegramDownloadStatus(Status):
         """
         :return: Download speed in Bytes/Seconds
         """
-        return self.obj.download_speed
+        return self.__obj.download_speed
 
     def speed(self):
         return f'{get_readable_file_size(self.speed_raw())}/s'
@@ -49,8 +44,8 @@ class TelegramDownloadStatus(Status):
         try:
             seconds = (self.size_raw() - self.processed_bytes()) / self.speed_raw()
             return f'{get_readable_time(seconds)}'
-        except ZeroDivisionError:
+        except:
             return '-'
 
     def download(self):
-        return self.obj
+        return self.__obj

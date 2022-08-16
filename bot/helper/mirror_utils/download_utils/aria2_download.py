@@ -1,107 +1,183 @@
-from bot import aria2, download_dict_lock, STOP_DUPLICATE, TORRENT_DIRECT_LIMIT, TAR_UNZIP_LIMIT
+from time import sleep, time
+
+from bot import aria2, download_dict_lock, download_dict, STOP_DUPLICATE, BASE_URL, LOGGER
 from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
-from bot.helper.ext_utils.bot_utils import *
+from bot.helper.ext_utils.bot_utils import is_magnet, getDownloadByGid, new_thread, bt_selection_buttons
 from bot.helper.mirror_utils.status_utils.aria_download_status import AriaDownloadStatus
-from bot.helper.telegram_helper.message_utils import *
-import threading
-from aria2p import API
-from time import sleep
+from bot.helper.telegram_helper.message_utils import sendMarkup, sendStatusMessage, sendMessage, deleteMessage, update_all_messages
+from bot.helper.ext_utils.fs_utils import get_base_name, clean_unwanted
 
 
-class AriaDownloadHelper:
-
-    def __init__(self):
-        super().__init__()
-
-    @new_thread
-    def __onDownloadStarted(self, api, gid):
-        if STOP_DUPLICATE or TORRENT_DIRECT_LIMIT is not None or TAR_UNZIP_LIMIT is not None:
-            sleep(2)
+@new_thread
+def __onDownloadStarted(api, gid):
+    download = api.get_download(gid)
+    if download.is_metadata:
+        LOGGER.info(f'onDownloadStarted: {gid} METADATA')
+        sleep(1)
+        dl = getDownloadByGid(gid)
+        listener = dl.listener()
+        if listener.select:
+            metamsg = "Downloading Metadata, wait then you can select files. Use torrent file to avoid this wait."
+            meta = sendMessage(metamsg, listener.bot, listener.message)
+            while True:
+                try:
+                    download = api.get_download(gid)
+                except:
+                    deleteMessage(listener.bot, meta)
+                    break
+                if download.followed_by_ids:
+                    deleteMessage(listener.bot, meta)
+                    break
+        return
+    else:
+        LOGGER.info(f'onDownloadStarted: {download.name} - Gid: {gid}')
+    try:
+        if STOP_DUPLICATE:
+            sleep(1)
             dl = getDownloadByGid(gid)
-            download = aria2.get_download(gid)
-            if STOP_DUPLICATE and dl is not None:
-                LOGGER.info(f"Checking File/Folder if already in Drive...")
-                sname = aria2.get_download(gid).name
-                if dl.getListener().isTar:
-                    sname = sname + ".tar"
-                if dl.getListener().extract:
-                    smsg = None
-                else:
-                    gdrive = GoogleDriveHelper(None)
-                    smsg, button = gdrive.drive_list(sname)
+            if not dl:
+                return
+            listener = dl.listener()
+            if listener.isLeech or listener.select:
+                return
+            download = api.get_download(gid)
+            if not download.is_torrent:
+                sleep(3)
+                download = download.live
+            LOGGER.info('Checking File/Folder if already in Drive...')
+            sname = download.name
+            if listener.isZip:
+                sname = sname + ".zip"
+            elif listener.extract:
+                try:
+                    sname = get_base_name(sname)
+                except:
+                    sname = None
+            if sname is not None:
+                smsg, button = GoogleDriveHelper().drive_list(sname, True)
                 if smsg:
-                    dl.getListener().onDownloadError(f'File/Folder already available in Drive.\n\n')
-                    aria2.remove([download], force=True)
-                    sendMarkup("Here are the search results:", dl.getListener().bot, dl.getListener().update, button)
-                    return
-            if (TORRENT_DIRECT_LIMIT is not None or TAR_UNZIP_LIMIT is not None) and dl is not None:
-                size = aria2.get_download(gid).total_length
-                if dl.getListener().isTar or dl.getListener().extract:
-                    is_tar_ext = True
-                    mssg = f'Tar/Unzip limit is {TAR_UNZIP_LIMIT}'
-                else:
-                    is_tar_ext = False
-                    mssg = f'Torrent/Direct limit is {TORRENT_DIRECT_LIMIT}'
-                result = check_limit(size, TORRENT_DIRECT_LIMIT, TAR_UNZIP_LIMIT, is_tar_ext)
-                if result:
-                    dl.getListener().onDownloadError(f'{mssg}.\nYour File/Folder size is {get_readable_file_size(size)}')
-                    aria2.remove([download], force=True)
-                    return
-        update_all_messages()
+                    listener.onDownloadError('File/Folder already available in Drive.\n\n')
+                    api.remove([download], force=True, files=True)
+                    return sendMarkup("Here are the search results:", listener.bot, listener.message, button)
+    except Exception as e:
+        LOGGER.error(f"{e} onDownloadStart: {gid} check duplicate didn't pass")
 
-    @staticmethod
-    def __onDownloadComplete(api: API, gid):
-        dl = getDownloadByGid(gid)
-        download = aria2.get_download(gid)
-        if download.followed_by_ids:
-            new_gid = download.followed_by_ids[0]
-            new_download = aria2.get_download(new_gid)
-            if dl is None:
-                dl = getDownloadByGid(new_gid)
+@new_thread
+def __onDownloadComplete(api, gid):
+    try:
+        download = api.get_download(gid)
+    except:
+        return
+    if download.followed_by_ids:
+        new_gid = download.followed_by_ids[0]
+        LOGGER.info(f'Gid changed from {gid} to {new_gid}')
+        dl = getDownloadByGid(new_gid)
+        listener = dl.listener()
+        if BASE_URL is not None and listener.select:
+            SBUTTONS = bt_selection_buttons(new_gid)
+            msg = "Your download paused. Choose files then press Done Selecting button to start downloading."
+            sendMarkup(msg, listener.bot, listener.message, SBUTTONS)
+    elif download.is_torrent:
+        if dl := getDownloadByGid(gid):
+            if hasattr(dl, 'listener'):
+                listener = dl.listener()
+                if hasattr(listener, 'uploaded'):
+                    LOGGER.info(f"Cancelling Seed: {download.name} onDownloadComplete")
+                    listener.onUploadError(f"Seeding stopped with Ratio: {dl.ratio()} and Time: {dl.seeding_time()}")
+                    api.remove([download], force=True, files=True)
+    else:
+        LOGGER.info(f"onDownloadComplete: {download.name} - Gid: {gid}")
+        if dl := getDownloadByGid(gid):
+            dl.listener().onDownloadComplete()
+            api.remove([download], force=True, files=True)
+
+@new_thread
+def __onBtDownloadComplete(api, gid):
+    seed_start_time = time()
+    sleep(1)
+    download = api.get_download(gid)
+    LOGGER.info(f"onBtDownloadComplete: {download.name} - Gid: {gid}")
+    if dl := getDownloadByGid(gid):
+        listener = dl.listener()
+        if listener.select:
+            clean_unwanted(download.dir)
+        if listener.seed:
+            try:
+                api.set_options({'max-upload-limit': '0'}, [download])
+            except Exception as e:
+                LOGGER.error(f'{e} You are not able to seed because you added global option seed-time=0 without adding specific seed_time for this torrent')
+        listener.onDownloadComplete()
+        if listener.seed:
             with download_dict_lock:
-                download_dict[dl.uid()] = AriaDownloadStatus(new_gid, dl.getListener())
-                if new_download.is_torrent:
-                    download_dict[dl.uid()].is_torrent = True
-            update_all_messages()
-            LOGGER.info(f'Changed gid from {gid} to {new_gid}')
+                if listener.uid not in download_dict:
+                    api.remove([download], force=True, files=True)
+                    return
+                download_dict[listener.uid] = AriaDownloadStatus(gid, listener)
+                download_dict[listener.uid].start_time = seed_start_time
+            LOGGER.info(f"Seeding started: {download.name} - Gid: {gid}")
+            download = download.live
+            if download.is_complete:
+                if dl := getDownloadByGid(gid):
+                    LOGGER.info(f"Cancelling Seed: {download.name}")
+                    listener.onUploadError(f"Seeding stopped with Ratio: {dl.ratio()} and Time: {dl.seeding_time()}")
+                    api.remove([download], force=True, files=True)
+            else:
+                listener.uploaded = True
+                update_all_messages()
         else:
-            if dl:
-                threading.Thread(target=dl.getListener().onDownloadComplete).start()
+            api.remove([download], force=True, files=True)
 
-    @new_thread
-    def __onDownloadStopped(self, api, gid):
-        sleep(4)
-        dl = getDownloadByGid(gid)
-        if dl: 
-            dl.getListener().onDownloadError('★ 𝗠𝗔𝗚𝗡𝗘𝗧/𝗧𝗢𝗥𝗥𝗘𝗡𝗧 𝗟𝗜𝗡𝗞 𝗜𝗦 𝗗𝗘𝗔𝗗 ❌ ★')
+@new_thread
+def __onDownloadStopped(api, gid):
+    sleep(6)
+    if dl := getDownloadByGid(gid):
+        dl.listener().onDownloadError('Dead torrent!')
 
-    @new_thread
-    def __onDownloadError(self, api, gid):
-        LOGGER.info(f"onDownloadError: {gid}")
-        sleep(0.5)  # sleep for split second to ensure proper dl gid update from onDownloadComplete
-        dl = getDownloadByGid(gid)
-        download = aria2.get_download(gid)
+@new_thread
+def __onDownloadError(api, gid):
+    LOGGER.info(f"onDownloadError: {gid}")
+    error = "None"
+    try:
+        download = api.get_download(gid)
         error = download.error_message
         LOGGER.info(f"Download Error: {error}")
-        if dl: 
-            dl.getListener().onDownloadError(error)
+    except:
+        pass
+    if dl := getDownloadByGid(gid):
+        dl.listener().onDownloadError(error)
 
-    def start_listener(self):
-        aria2.listen_to_notifications(threaded=True, on_download_start=self.__onDownloadStarted,
-                                      on_download_error=self.__onDownloadError,
-                                      on_download_stop=self.__onDownloadStopped,
-                                      on_download_complete=self.__onDownloadComplete,
-                                      timeout=1)
+def start_listener():
+    aria2.listen_to_notifications(threaded=True,
+                                  on_download_start=__onDownloadStarted,
+                                  on_download_error=__onDownloadError,
+                                  on_download_stop=__onDownloadStopped,
+                                  on_download_complete=__onDownloadComplete,
+                                  on_bt_download_complete=__onBtDownloadComplete,
+                                  timeout=60)
 
-    @staticmethod
-    def add_download(link: str, path, listener, filename):
-        if is_magnet(link):
-            download = aria2.add_magnet(link, {'dir': path, 'out': filename})
-        else:
-            download = aria2.add_uris([link], {'dir': path, 'out': filename})
-        if download.error_message:  # no need to proceed further at this point
-            listener.onDownloadError(download.error_message)
-            return
-        with download_dict_lock:
-            download_dict[listener.uid] = AriaDownloadStatus(download.gid, listener)
-            LOGGER.info(f"Started: {download.gid} DIR:{download.dir} ")
+def add_aria2c_download(link: str, path, listener, filename, auth, select, ratio, seed_time):
+    args = {'dir': path, 'max-upload-limit': '1K'}
+    if filename:
+        args['out'] = filename
+    if auth:
+        args['header'] = f"authorization: {auth}"
+    if ratio:
+        args['seed-ratio'] = ratio
+    if seed_time:
+        args['seed-time'] = seed_time
+    if is_magnet(link):
+        download = aria2.add_magnet(link, args)
+    else:
+        download = aria2.add_uris([link], args)
+    if download.error_message:
+        error = str(download.error_message).replace('<', ' ').replace('>', ' ')
+        LOGGER.info(f"Download Error: {error}")
+        return sendMessage(error, listener.bot, listener.message)
+    with download_dict_lock:
+        download_dict[listener.uid] = AriaDownloadStatus(download.gid, listener)
+        LOGGER.info(f"Aria2Download started: {download.gid}")
+    listener.onDownloadStart()
+    if not select:
+        sendStatusMessage(listener.message, listener.bot)
+
+start_listener()
